@@ -204,7 +204,10 @@ recorded as the appointment's blocking detail, the application stays
 pending, no revision is consumed and nothing is retried automatically.
 A decision through any other path -- manual single/batch approval,
 waitlist auto-approval, a handover or an emergency occupation --
-invalidates the waiting appointment in the same transaction, so due
+invalidates the waiting appointment in the same transaction, recording
+the decision instant as the appointment's ``processed_at`` (an
+invalidation is not a scheduled auto-approval: the approval revision and
+the guard-band snapshot stay empty and no revision is consumed), so due
 processing, cancellation, rescheduling and other decisions compete under
 one lock and exactly one outcome wins; a restart never double-approves.
 
@@ -215,11 +218,16 @@ revision and pin at the current revision of their operation (a snapshot at
 that same revision already presents them); a due approval pins at the
 revision it consumes; a processing-time block pins at the revision current
 when the sweep records it; an invalidation pins at the deciding approval's
-revision.  Revision snapshots replay these rows instead of reading the
-mutable appointment row, so an appointment booked later is absent from
-earlier revisions and an outcome is only visible from its own decision
-revision onwards -- older revisions still present the appointment as
-waiting to fire, without leaking its approval revision.
+revision and carries the decision instant.  Revision snapshots replay
+these rows instead of reading the mutable appointment row, so an
+appointment booked later is absent from earlier revisions and an outcome
+is only visible from its own decision revision onwards -- older revisions
+still present the appointment as waiting to fire, without leaking its
+approval revision, processing instant or outcome reason.  From the
+decision revision onwards the snapshot presents the same
+``processed_at``/``outcome_reason`` as the live appointment queries;
+appointments invalidated before the decision instant was recorded keep it
+NULL (a time is never fabricated for them).
 """
 from __future__ import annotations
 
@@ -1311,7 +1319,12 @@ def _append_schedule_event(
 
 
 def invalidate_scheduled_approvals(
-    session, application_id: int, reason: str, revision: int
+    session,
+    application_id: int,
+    reason: str,
+    revision: int,
+    *,
+    at: datetime | None = None,
 ) -> list[ScheduledApproval]:
     """Invalidate every still-waiting appointment of a decided application.
 
@@ -1319,10 +1332,16 @@ def invalidate_scheduled_approvals(
     another path (manual single/batch approval, waitlist auto-approval during
     a suspend/revoke/emergency-release drain, handover successor approval or
     an emergency occupation).  Only ``scheduled`` rows move; already terminal
-    appointments are left untouched.  Each invalidated row appends an
-    immutable event pinned at ``revision`` (the deciding approval's
-    revision), so historical snapshots before that revision still show the
-    appointment waiting to fire.  Returns the rows invalidated.
+    appointments are left untouched.  The decision instant (``at``, defaulting
+    to the current UTC time) is recorded on the row as ``processed_at`` and
+    carried by the immutable event each invalidated row appends, pinned at
+    ``revision`` (the deciding approval's revision): historical snapshots
+    before that revision still show the appointment waiting to fire, while
+    snapshots from that revision onwards present the same
+    ``processed_at``/``outcome_reason`` as the live row.  An invalidation is
+    not a scheduled auto-approval: ``approval_revision`` and
+    ``processed_guard_band`` stay NULL and no revision is consumed.  Returns
+    the rows invalidated.
     """
     rows = (
         session.query(ScheduledApproval)
@@ -1332,10 +1351,14 @@ def invalidate_scheduled_approvals(
         )
         .all()
     )
-    now = datetime.now(timezone.utc)
+    now = at if at is not None else datetime.now(timezone.utc)
     for row in rows:
         row.status = SCHEDULED_INVALIDATED
         row.outcome_reason = reason
+        # The decision moment: from now on the appointment is known to never
+        # fire.  No adjudication ran for it, so the guard-band snapshot and
+        # the approval revision stay NULL.
+        row.processed_at = now
         row.updated_at = now
         _append_schedule_event(
             session,
@@ -1344,6 +1367,7 @@ def invalidate_scheduled_approvals(
             revision,
             at=now,
             outcome_reason=reason,
+            processed_at=now,
         )
     return rows
 
@@ -1369,7 +1393,9 @@ def serialize_scheduled_approval(
         ),
     }
     if booking.processed_at is not None:
-        # The UTC instant the appointment was actually re-adjudicated.
+        # The UTC instant the appointment was actually re-adjudicated, or —
+        # for an invalidated appointment — the instant the deciding
+        # transaction superseded it.
         body["processed_at"] = iso(booking.processed_at)
     if booking.processed_guard_band is not None:
         body["processed_guard_band"] = booking.processed_guard_band
@@ -1443,16 +1469,23 @@ def process_due_scheduled_approvals(
         if booking.status != SCHEDULED_STATUS:
             continue
         row = session.get(Application, booking.application_id)
-        booking.processed_at = current
-        booking.processed_guard_band = meta.guard_band
 
         if row is None or row.status != "pending":
             # Decided by another path first; that path invalidated the row.
+            # The invalidation records the decision instant itself and never
+            # carries a guard-band snapshot or approval revision.
             if row is not None:
                 invalidate_scheduled_approvals(
-                    session, row.id, f"application_{row.status}", meta.revision
+                    session,
+                    row.id,
+                    f"application_{row.status}",
+                    meta.revision,
+                    at=current,
                 )
             continue
+
+        booking.processed_at = current
+        booking.processed_guard_band = meta.guard_band
 
         candidate = to_license(row)
         effective = load_candidate_effective_licenses(
@@ -1816,8 +1849,11 @@ def replay_scheduled_approvals(
     ``booked`` event is visible (appointments booked later are absent from
     earlier revisions); terminal outcomes only show from the revision their
     deciding event is pinned to, so older revisions still present the
-    appointment as waiting to fire and never leak its approval revision.
-    The record shape matches the live audit rows exactly.
+    appointment as waiting to fire and never leak its approval revision,
+    processing instant or outcome reason.  An invalidation presents the
+    decision instant recorded by the deciding transaction as
+    ``processed_at`` (NULL for appointments invalidated before that was
+    recorded).  The record shape matches the live audit rows exactly.
     """
     by_booking: dict[int, list[ScheduledApprovalEvent]] = {}
     for ev in events:
@@ -1880,6 +1916,14 @@ def replay_scheduled_approvals(
             elif ev.event_type == "invalidated":
                 record["status"] = SCHEDULED_INVALIDATED
                 record["outcome_reason"] = ev.outcome_reason
+                # The decision instant recorded by the deciding transaction;
+                # appointments invalidated before it was recorded keep NULL
+                # (a decision moment is never fabricated for them).
+                record["processed_at"] = (
+                    iso(ev.processed_at)
+                    if ev.processed_at is not None
+                    else None
+                )
                 record["updated_at"] = iso(ev.created_at)
         if record is not None:
             records.append(record)

@@ -617,10 +617,14 @@ class ScheduledApproval(Base):
     approval, a license-handover successor approval, an emergency occupation
     or a waitlist auto-approval during a suspend/revoke/emergency-release
     drain -- leaves its appointment ``invalidated`` inside the same
-    transaction, so it can never fire afterwards.  Cancellation,
-    rescheduling, due processing and the other decisions therefore compete
-    under one arbitration and exactly one outcome wins; a restart never
-    approves the same appointment twice (only ``scheduled`` rows fire).
+    transaction, so it can never fire afterwards.  The deciding transaction
+    records its decision instant as the appointment's ``processed_at`` (an
+    invalidation is not a scheduled auto-approval: ``approval_revision`` and
+    ``processed_guard_band`` stay NULL and no revision is consumed).
+    Cancellation, rescheduling, due processing and the other decisions
+    therefore compete under one arbitration and exactly one outcome wins; a
+    restart never approves the same appointment twice (only ``scheduled``
+    rows fire).
     """
 
     __tablename__ = "scheduled_approvals"
@@ -647,7 +651,11 @@ class ScheduledApproval(Base):
 
     # Processing outcome fields (NULL while the appointment is still
     # scheduled/cancelled-before-processing).
-    # The UTC instant the sweeper actually re-adjudicated the appointment.
+    # The UTC instant the appointment reached its decision: the sweeper's
+    # actual re-adjudication instant for ``approved``/``blocked``, and the
+    # deciding transaction's instant for ``invalidated``.  Appointments
+    # invalidated before the decision instant was recorded keep NULL -- a
+    # time is never fabricated for them.
     processed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -706,13 +714,15 @@ class ScheduledApprovalEvent(Base):
     * ``invalidated`` pins at the revision of the approval that decided the
       application through another path (manual single/batch approval,
       waitlist auto-approval, handover successor approval or emergency
-      occupation approval).
+      occupation approval) and carries that transaction's decision instant
+      as ``processed_at``.
 
     Historical revision snapshots replay these rows in primary-key order and
     never read the mutable ``scheduled_approvals`` row: an appointment booked
     later is absent from earlier revisions, and an outcome is visible only
     from its own decision revision onwards (older revisions still present the
-    appointment as waiting to fire, without leaking its approval revision).
+    appointment as waiting to fire, without leaking its approval revision,
+    processing instant or outcome reason).
     """
 
     __tablename__ = "scheduled_approval_events"
@@ -737,6 +747,8 @@ class ScheduledApprovalEvent(Base):
     # cancelled / invalidated: why the appointment ended without firing.
     outcome_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # approved / blocked: the processing instant and the band it used.
+    # invalidated: the decision instant of the superseding transaction (NULL
+    # for appointments invalidated before that was recorded).
     processed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

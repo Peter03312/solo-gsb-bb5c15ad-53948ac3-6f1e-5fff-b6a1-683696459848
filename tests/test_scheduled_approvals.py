@@ -563,6 +563,167 @@ class TestInvalidationByOtherDecisions:
         assert booking["outcome_reason"] == "emergency_occupation"
 
 
+class TestInvalidationDecisionInstant:
+    """An invalidation records the decision moment as ``processed_at``.
+
+    The live appointment queries report it; an invalidation is not a
+    scheduled auto-approval, so ``approval_revision`` /
+    ``processed_guard_band`` stay empty and no revision is consumed.
+    """
+
+    def test_manual_approval_invalidation_records_processed_at(self, client):
+        b = submit(client, 100, 110, "B")
+        booking_id = book(client, b, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        before = datetime.now(timezone.utc)
+        approve(client, b, 0)  # revision 1
+        after = datetime.now(timezone.utc)
+
+        booking = get_booking(client, booking_id)
+        assert booking["status"] == "invalidated"
+        assert booking["outcome_reason"] == "manual_approval"
+        processed_at = datetime.fromisoformat(
+            booking["processed_at"].replace("Z", "+00:00")
+        )
+        assert before <= processed_at <= after
+        # Not a scheduled auto-approval: no approval revision, no band
+        # snapshot, no blockers.
+        assert "approval_revision" not in booking
+        assert "processed_guard_band" not in booking
+        assert "blocked_details" not in booking
+        # The decision consumed no extra revision and never fires later.
+        assert (
+            client.get("/api/revision/current").json()["current_revision"] == 1
+        )
+        assert process_due(client)["processed_count"] == 0
+
+    def test_batch_approval_invalidation_records_processed_at(self, client):
+        a = submit(client, 100, 110, "A")
+        b = submit(client, 200, 210, "B")
+        id_a = book(client, a, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        id_b = book(client, b, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        r = client.post(
+            "/api/applications/batch-approve",
+            json={"expected_revision": 0, "application_ids": [a, b]},
+        )
+        assert r.status_code == 200, r.text
+        for booking_id in (id_a, id_b):
+            booking = get_booking(client, booking_id)
+            assert booking["status"] == "invalidated"
+            assert booking["outcome_reason"] == "batch_approval"
+            assert booking["processed_at"]
+            assert "approval_revision" not in booking
+            assert "processed_guard_band" not in booking
+
+    def test_waitlist_auto_approval_invalidation_records_processed_at(
+        self, client
+    ):
+        lic = submit(client, 100, 110, "lic")
+        approve(client, lic, 0)
+        b = submit(client, 105, 108, "B")
+        client.post(f"/api/applications/{b}/waitlist")
+        booking_id = book(client, b, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        r = client.post(f"/api/applications/{lic}/revoke", json={"reason": "x"})
+        assert r.status_code == 200, r.text
+        assert b in r.json()["auto_approved_application_ids"]
+        booking = get_booking(client, booking_id)
+        assert booking["status"] == "invalidated"
+        assert booking["outcome_reason"] == "waitlist_auto_approval"
+        assert booking["processed_at"]
+        assert "approval_revision" not in booking
+        assert "processed_guard_band" not in booking
+
+    def test_license_transfer_invalidation_records_processed_at(self, client):
+        source = submit(client, 100, 110, "source")
+        approve(client, source, 0)
+        successor = submit(client, 100, 110, "successor")
+        booking_id = book(client, successor, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        r = client.post(
+            "/api/license-transfers",
+            json={
+                "source_application_id": source,
+                "successor_application_id": successor,
+                "expected_revision": 1,
+                "reason": "swap",
+            },
+        )
+        assert r.status_code == 200, r.text
+        booking = get_booking(client, booking_id)
+        assert booking["status"] == "invalidated"
+        assert booking["outcome_reason"] == "license_transfer"
+        assert booking["processed_at"]
+        assert "approval_revision" not in booking
+        assert "processed_guard_band" not in booking
+
+    def test_emergency_occupation_invalidation_records_processed_at(
+        self, client
+    ):
+        e = submit(client, 100, 110, "emergency")
+        booking_id = book(client, e, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        r = client.post(
+            "/api/emergency-occupations",
+            json={"application_id": e, "expected_revision": 0, "reason": "burst"},
+        )
+        assert r.status_code == 201, r.text
+        booking = get_booking(client, booking_id)
+        assert booking["status"] == "invalidated"
+        assert booking["outcome_reason"] == "emergency_occupation"
+        assert booking["processed_at"]
+        assert "approval_revision" not in booking
+        assert "processed_guard_band" not in booking
+
+    def test_listing_and_application_history_carry_processed_at(self, client):
+        b = submit(client, 100, 110, "B")
+        booking_id = book(client, b, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        approve(client, b, 0)
+        expected = get_booking(client, booking_id)["processed_at"]
+
+        listing = client.get(
+            "/api/scheduled-approvals", params={"status": "invalidated"}
+        ).json()
+        assert listing["count"] == 1
+        assert listing["scheduled_approvals"][0]["processed_at"] == expected
+
+        history = client.get(
+            f"/api/applications/{b}/scheduled-approvals"
+        ).json()
+        assert history["scheduled_approvals"][0]["processed_at"] == expected
+
+    def test_cancelled_appointment_has_no_processed_at(self, client):
+        a = submit(client, 100, 110, "A")
+        booking_id = book(client, a, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        cancel(client, a)
+        booking = get_booking(client, booking_id)
+        assert booking["status"] == "cancelled"
+        assert "processed_at" not in booking
+        assert "approval_revision" not in booking
+        assert "processed_guard_band" not in booking
+
+    def test_waiting_appointment_has_no_processed_at(self, client):
+        a = submit(client, 100, 110, "A")
+        booking_id = book(client, a, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        booking = get_booking(client, booking_id)
+        assert booking["status"] == "scheduled"
+        assert "processed_at" not in booking
+
+
 class TestStartupCatchup:
     def test_due_appointment_while_process_down_processed_at_restart(
         self, client

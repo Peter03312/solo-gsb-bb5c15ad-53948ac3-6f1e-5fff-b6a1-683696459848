@@ -271,6 +271,68 @@ class TestOutcomeVisibilityFromDecisionRevision:
         assert row1["status"] == "invalidated"
         assert row1["outcome_reason"] == "emergency_occupation"
 
+    def test_invalidation_processed_at_matches_live_row_from_decision_revision(
+        self, client
+    ):
+        # The decision instant is recorded in the deciding transaction: the
+        # snapshot at the deciding revision presents exactly the live row's
+        # processed_at, while the earlier revision still shows the
+        # appointment waiting to fire with no outcome fields at all.
+        b = submit(client, 100, 110, "B")
+        booking_id = book(client, b, NOW + timedelta(days=1))[
+            "scheduled_approval_id"
+        ]
+        approve(client, b, 0)  # revision 1 decides the application
+
+        live = client.get(f"/api/scheduled-approvals/{booking_id}").json()
+        assert live["status"] == "invalidated"
+        assert live["processed_at"]
+
+        row0 = only_appointment_at(client, 0)
+        assert row0["status"] == "scheduled"
+        assert row0["processed_at"] is None
+        assert row0["outcome_reason"] is None
+
+        # An unrelated decision advances the revision; the invalidated
+        # appointment keeps presenting the same decision instant.
+        other = submit(client, 200, 210, "other")
+        approve(client, other, 1)  # revision 2
+
+        for rev in (1, 2):
+            row = only_appointment_at(client, rev)
+            assert row["status"] == "invalidated"
+            assert row["processed_at"] == live["processed_at"]
+            assert row["outcome_reason"] == live["outcome_reason"]
+            # An invalidation is not a scheduled auto-approval: the approval
+            # revision and the band snapshot stay empty.
+            assert row["approval_revision"] is None
+            assert row["processed_guard_band"] is None
+
+    def test_batch_invalidation_processed_at_per_member_revision(self, client):
+        a = submit(client, 100, 110, "A")
+        b = submit(client, 200, 210, "B")
+        id_a = book(client, a, NOW + timedelta(days=1))["scheduled_approval_id"]
+        id_b = book(client, b, NOW + timedelta(days=1))["scheduled_approval_id"]
+        r = client.post(
+            "/api/applications/batch-approve",
+            json={"expected_revision": 0, "application_ids": [a, b]},
+        )
+        assert r.status_code == 200, r.text  # revisions 1 and 2
+
+        # At revision 1 only A's appointment is invalidated (with its
+        # decision instant); B's is still waiting without one.
+        rows1 = {row["id"]: row for row in appointments_at(client, 1)}
+        assert rows1[id_a]["status"] == "invalidated"
+        assert rows1[id_a]["processed_at"] is not None
+        assert rows1[id_b]["status"] == "scheduled"
+        assert rows1[id_b]["processed_at"] is None
+
+        rows2 = {row["id"]: row for row in appointments_at(client, 2)}
+        assert rows2[id_b]["status"] == "invalidated"
+        assert rows2[id_b]["processed_at"] is not None
+        assert rows2[id_b]["approval_revision"] is None
+        assert rows2[id_b]["processed_guard_band"] is None
+
     def test_blocked_visible_from_decision_revision_without_consuming_one(
         self, client
     ):
@@ -453,3 +515,50 @@ class TestLegacyRowBackfill:
         # Idempotent: a second run changes nothing.
         _ensure_scheduled_approval_events()
         assert only_appointment_at(client, 1)["status"] == "approved"
+
+    def test_legacy_invalidated_row_keeps_null_processed_at(self, client):
+        # Simulate a database written before the decision instant was
+        # recorded: an invalidated appointment row with no lifecycle events
+        # and no processed_at.  The backfill must not fabricate a decision
+        # moment -- the snapshot and the live queries keep NULL.
+        from app.db import SessionLocal, _ensure_scheduled_approval_events
+        from app.models import (
+            Application,
+            ApprovalEvent,
+            RevisionMeta,
+            ScheduledApproval,
+        )
+
+        a = submit(client, 100, 110, "A")
+        with SessionLocal() as s, s.begin():
+            meta = s.get(RevisionMeta, 1)
+            meta.revision = 1
+            s.add(ApprovalEvent(revision=1, application_id=a, guard_band=2.0))
+            s.get(Application, a).status = "approved"
+            legacy = ScheduledApproval(
+                application_id=a,
+                scheduled_at=NOW + timedelta(hours=1),
+                status="invalidated",
+                outcome_reason="manual_approval",
+            )
+            s.add(legacy)
+            s.flush()
+            booking_id = legacy.id
+
+        _ensure_scheduled_approval_events()
+        row0 = only_appointment_at(client, 0)
+        assert row0["id"] == booking_id
+        assert row0["status"] == "scheduled"
+        assert row0["processed_at"] is None
+        row1 = only_appointment_at(client, 1)
+        assert row1["status"] == "invalidated"
+        assert row1["outcome_reason"] == "manual_approval"
+        # No reliable decision moment exists for the legacy row: it stays
+        # NULL instead of being backfilled with a fabricated time.
+        assert row1["processed_at"] is None
+        assert row1["approval_revision"] is None
+        assert row1["processed_guard_band"] is None
+
+        live = client.get(f"/api/scheduled-approvals/{booking_id}").json()
+        assert live["status"] == "invalidated"
+        assert "processed_at" not in live
