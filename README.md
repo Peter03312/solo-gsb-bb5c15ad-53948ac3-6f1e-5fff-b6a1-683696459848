@@ -617,8 +617,13 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 （`outcome_reason` 标明来源），到期后不再触发：手动单笔批准（`manual_approval`）、
 整组批准（`batch_approval`）、暂停/撤销/紧急解除排空中的**候补自动批准**
 （`waitlist_auto_approval`）、换机交接的接替批准（`license_transfer`）、紧急占用
-批准（`emergency_occupation`）。取消、改期、到期处理与这些审批都在同一修订号锁上
-串行，因此**只允许一种结果生效**。
+批准（`emergency_occupation`）。失效在**同一事务**内把**决定时刻**记入预约行的
+`processed_at` 并写入预约生命周期事件：实时查询与自决定修订号起的历史快照返回
+一致的 `processed_at` 与 `outcome_reason`；更早的修订仍显示待执行，不提前泄漏。
+失效**不算预约自动审批**：`approval_revision`、`processed_guard_band` 仍为空，
+预约**不会再次到期执行**，失效本身也**不额外占用修订号**。取消与未到期的预约不填
+`processed_at`；缺少可靠决定时刻的旧记录（升级前已失效的行）保留空值，不推造时间。
+取消、改期、到期处理与这些审批都在同一修订号锁上串行，因此**只允许一种结果生效**。
 
 **查询与历史**
 
@@ -626,7 +631,9 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
   过滤列出预约；状态取值 `scheduled`/`approved`/`blocked`/`cancelled`/`invalidated`。
 - `GET /api/scheduled-approvals/{id}`：返回预约状态、约定时刻、**实际处理时间**
   `processed_at`、获批时的 `approval_revision`/`processed_guard_band`，或阻塞时的
-  `blocked_details`；终态另附 `outcome_reason`。
+  `blocked_details`；终态另附 `outcome_reason`。`processed_at` 是预约的**处置时刻**：
+  到期获批/阻塞时为扫描重裁时刻，失效时为决定它的那笔审批所在事务的时刻；
+  取消与待执行预约没有该字段，升级前已失效的旧记录同样为空（不推造）。
 - `GET /api/applications/{id}/scheduled-approvals`：单个申请的全部预约（含历史）。
 - `GET /api/revision/current` 追加 `scheduled_approval_ids`/`scheduled_approvals`
   （仅待执行项）；`GET /api/revision/{n}` 的批准记录追加 `scheduled` 标志，并附
@@ -637,13 +644,16 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
   `scheduled_approval_events`，锚定在其生效的修订号上——登记/改期/取消不占修订号，
   锚定在操作发生时的当前修订号（同一修订号内按当前状态呈现）；到期获批锚定在它
   占用的批准修订号；到期阻塞不占修订号，锚定在扫描决定时的当前修订号；失效锚定在
-  触发它的那笔审批（单笔/整组/候补自动/许可交接/紧急占用）的批准修订号。修订快照
-  按 `revision <= n` 回放这些事件：后来才登记的预约**不出现**在较早修订；尚未到达
-  决定修订的预约在旧修订中仍呈现 `scheduled`（待执行），`approval_revision`、
-  `processed_at`、`blocked_details`、`outcome_reason` 等结果字段**不提前泄漏**；
-  到达决定修订后才显示 `approved`/`blocked`/`cancelled`/`invalidated` 及对应结果。
-  每申请至多一条待执行预约的约束不变；既有预约查询接口、修订查询字段与非法修订
-  错误（404 `revision_out_of_range` / 422）保持兼容，历史查询只读。
+  触发它的那笔审批（单笔/整组/候补自动/许可交接/紧急占用）的批准修订号，并携带该
+  事务的决定时刻 `processed_at`。修订快照按 `revision <= n` 回放这些事件：后来才
+  登记的预约**不出现**在较早修订；尚未到达决定修订的预约在旧修订中仍呈现
+  `scheduled`（待执行），`approval_revision`、`processed_at`、`blocked_details`、
+  `outcome_reason` 等结果字段**不提前泄漏**；到达决定修订后才显示
+  `approved`/`blocked`/`cancelled`/`invalidated` 及对应结果（失效行自决定修订起
+  附与实时行一致的 `processed_at` 与 `outcome_reason`，`approval_revision` /
+  `processed_guard_band` 保持为空；无可靠决定时刻的旧失效行 `processed_at` 为
+  `null`）。每申请至多一条待执行预约的约束不变；既有预约查询接口、修订查询字段与
+  非法修订错误（404 `revision_out_of_range` / 422）保持兼容，历史查询只读。
 
 ### 可用调频位置查询（不改状态）
 
@@ -1874,7 +1884,10 @@ curl -s http://localhost:8000/api/scheduled-approvals/{预约ID}
 curl -s -X POST http://localhost:8000/api/applications/4/approve \
   -H 'Content-Type: application/json' -d '{"expected_revision":3}'
 curl -s http://localhost:8000/api/scheduled-approvals/{预约ID}
-# -> status="invalidated", outcome_reason="manual_approval"；到期扫描不再处理它
+# -> status="invalidated", outcome_reason="manual_approval",
+#    processed_at=决定它的那笔审批所在事务的 UTC 时刻（与历史快照一致）；
+#    无 approval_revision / processed_guard_band（失效不算预约自动审批）；
+#    到期扫描不再处理它，失效本身也不占修订号
 ```
 
 **预约审计按修订回放（不读实时行）**：设申请 5 在修订号 **0** 登记预约，随后在
@@ -1908,20 +1921,27 @@ curl -s http://localhost:8000/api/revision/0
 curl -s http://localhost:8000/api/revision/1
 # 失效决定于修订号 2 -> 修订号 1 仍呈现待执行，无结果字段：
 # {"revision": 1, "scheduled_approvals": [{"id": 9, "status": "scheduled",
-#   "approval_revision": null, "outcome_reason": null, ...}], ...}
+#   "processed_at": null, "approval_revision": null, "outcome_reason": null, ...}], ...}
 
 curl -s http://localhost:8000/api/revision/2
-# 自决定修订号 2 起才显示失效结果：
+# 自决定修订号 2 起才显示失效结果，processed_at 与实时查询一致：
 # {"revision": 2, "scheduled_approvals": [{"id": 9, "status": "invalidated",
-#   "outcome_reason": "manual_approval", "approval_revision": null, ...}], ...}
+#   "outcome_reason": "manual_approval", "processed_at": "2026-10-03T18:41:02Z",
+#   "approval_revision": null, "processed_guard_band": null, ...}], ...}
+
+curl -s http://localhost:8000/api/scheduled-approvals/9
+# 实时查询返回同一个 processed_at 与 outcome_reason：
+# {"id": 9, "status": "invalidated", "outcome_reason": "manual_approval",
+#  "processed_at": "2026-10-03T18:41:02Z", ...}
 ```
 
 整组批准、候补自动批准、许可交接与紧急占用触发的失效同理，各自锚定在对应申请
-的批准修订号（整组中每项各自锚定）；到期获批的预约自其批准修订号起显示
+的批准修订号（整组中每项各自锚定），并自该修订起显示与实时行一致的 `processed_at`
+（决定事务的 UTC 时刻）与 `outcome_reason`；到期获批的预约自其批准修订号起显示
 `approved` 与 `approval_revision`，到期阻塞自扫描决定时的当前修订号起显示
 `blocked` 与 `blocked_details`（阻塞不占修订号）。登记/改期/取消不占修订号，
 锚定在操作发生时的当前修订号——同一修订号内查询即按当前状态呈现（例如登记后
-立即取消，该修订号的快照直接显示 `cancelled`）。
+立即取消，该修订号的快照直接显示 `cancelled`；取消不填 `processed_at`）。
 
 启动可用性：服务重启时先对停机期间到期的预约做一次**补处理**（逻辑与
 `process-due` 完全相同，按重启时刻的带宽/有效许可/窗口重裁），随后才开始接受

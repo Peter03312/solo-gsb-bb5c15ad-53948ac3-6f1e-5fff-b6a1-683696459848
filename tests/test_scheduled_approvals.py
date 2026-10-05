@@ -477,6 +477,11 @@ class TestInvalidationByOtherDecisions:
         booking = get_booking(client, booking_id)
         assert booking["status"] == "invalidated"
         assert booking["outcome_reason"] == "manual_approval"
+        # The decision instant is recorded; an invalidation is not an
+        # approval, so no approval revision or guard-band snapshot appears.
+        assert booking["processed_at"]
+        assert booking.get("approval_revision") is None
+        assert booking.get("processed_guard_band") is None
         # Sweep does nothing, revision unchanged.
         assert process_due(client)["processed_count"] == 0
         assert (
@@ -497,8 +502,11 @@ class TestInvalidationByOtherDecisions:
             json={"expected_revision": 0, "application_ids": [a, b]},
         )
         assert r.status_code == 200, r.text
-        assert get_booking(client, id_a)["status"] == "invalidated"
-        assert get_booking(client, id_b)["status"] == "invalidated"
+        for booking_id in (id_a, id_b):
+            booking = get_booking(client, booking_id)
+            assert booking["status"] == "invalidated"
+            assert booking["outcome_reason"] == "batch_approval"
+            assert booking["processed_at"]
 
     def test_waitlist_auto_approval_on_revoke_invalidates_appointment(
         self, client
@@ -517,6 +525,7 @@ class TestInvalidationByOtherDecisions:
         booking = get_booking(client, booking_id)
         assert booking["status"] == "invalidated"
         assert booking["outcome_reason"] == "waitlist_auto_approval"
+        assert booking["processed_at"]
         # The auto approval event is waitlist-flagged, not scheduled-flagged.
         auto = [
             ev
@@ -547,6 +556,7 @@ class TestInvalidationByOtherDecisions:
         booking = get_booking(client, booking_id)
         assert booking["status"] == "invalidated"
         assert booking["outcome_reason"] == "license_transfer"
+        assert booking["processed_at"]
 
     def test_emergency_occupation_invalidates_appointment(self, client):
         e = submit(client, 100, 110, "emergency")
@@ -561,6 +571,78 @@ class TestInvalidationByOtherDecisions:
         booking = get_booking(client, booking_id)
         assert booking["status"] == "invalidated"
         assert booking["outcome_reason"] == "emergency_occupation"
+        assert booking["processed_at"]
+
+
+class TestInvalidationDecisionInstant:
+    """The invalidation chain records the decision instant (``processed_at``)
+    in the deciding transaction, without turning the appointment into an
+    approval; cancelled and still-waiting appointments carry no instant."""
+
+    def test_invalidated_processed_at_is_the_approval_transaction_instant(
+        self, client
+    ):
+        b = submit(client, 100, 110, "B")
+        booking_id = book(client, b, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        before = datetime.now(timezone.utc)
+        approve(client, b, 0)
+        after = datetime.now(timezone.utc)
+        booking = get_booking(client, booking_id)
+        processed_at = datetime.fromisoformat(
+            booking["processed_at"].replace("Z", "+00:00")
+        )
+        assert before <= processed_at <= after
+        # The list endpoint agrees with the single-appointment query.
+        listing = client.get(
+            "/api/scheduled-approvals", params={"status": "invalidated"}
+        ).json()
+        assert listing["count"] == 1
+        assert (
+            listing["scheduled_approvals"][0]["processed_at"]
+            == booking["processed_at"]
+        )
+
+    def test_invalidated_appointment_never_fires_and_consumes_no_revision(
+        self, client
+    ):
+        # A due appointment invalidated before the sweep neither fires nor
+        # consumes a revision; its processed_at stays the invalidation
+        # instant (the sweep does not touch it again).
+        b = submit(client, 100, 110, "B")
+        booking_id = book_due(client, b)
+        approve(client, b, 0)  # revision 1 invalidates the due appointment
+        before_sweep = get_booking(client, booking_id)
+        assert before_sweep["status"] == "invalidated"
+        summary = process_due(client)
+        assert summary["processed_count"] == 0
+        assert summary["final_revision"] == 1
+        after_sweep = get_booking(client, booking_id)
+        assert after_sweep["processed_at"] == before_sweep["processed_at"]
+        approvals = client.get("/api/revision/current").json()["approvals"]
+        assert len(approvals) == 1  # only the manual approval
+
+    def test_cancelled_appointment_has_no_processed_at(self, client):
+        a = submit(client, 100, 110, "A")
+        booking_id = book(client, a, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        cancel(client, a)
+        booking = get_booking(client, booking_id)
+        assert booking["status"] == "cancelled"
+        assert "processed_at" not in booking
+        assert booking.get("approval_revision") is None
+
+    def test_waiting_appointment_has_no_processed_at(self, client):
+        a = submit(client, 100, 110, "A")
+        booking_id = book(client, a, NOW + timedelta(days=1)).json()[
+            "scheduled_approval_id"
+        ]
+        booking = get_booking(client, booking_id)
+        assert booking["status"] == "scheduled"
+        assert "processed_at" not in booking
+
 
 
 class TestStartupCatchup:
@@ -616,6 +698,37 @@ class TestStartupCatchup:
         booking = get_booking(client, booking_id)
         assert booking["status"] == "blocked"
         assert client.get(f"/api/applications/{b}").json()["status"] == "pending"
+
+    def test_sweep_invalidates_appointment_of_already_decided_application(
+        self, client
+    ):
+        # Legacy-shaped row: the application was decided while its due
+        # appointment was never invalidated (e.g. written before the
+        # invalidation chain existed).  The sweep disposes of it as
+        # invalidated with the sweep's decision instant -- but no guard-band
+        # snapshot or approval revision (it is not a scheduled approval).
+        from app.db import SessionLocal
+        from app.models import Application, ScheduledApproval
+
+        a = submit(client, 100, 110, "A")
+        past = datetime.now(timezone.utc) - timedelta(minutes=5)
+        with SessionLocal() as s, s.begin():
+            s.get(Application, a).status = "approved"
+            s.add(ScheduledApproval(application_id=a, scheduled_at=past))
+            booking_id = s.query(ScheduledApproval).one().id
+        from app.main import run_scheduled_approval_sweep
+
+        summary = run_scheduled_approval_sweep()
+        assert summary["processed_count"] == 0  # invalidation is not an outcome
+        assert summary["final_revision"] == 0  # no revision consumed
+        booking = get_booking(client, booking_id)
+        assert booking["status"] == "invalidated"
+        assert booking["outcome_reason"] == "application_approved"
+        assert booking["processed_at"]
+        assert booking.get("approval_revision") is None
+        assert booking.get("processed_guard_band") is None
+        # Never fires again.
+        assert run_scheduled_approval_sweep()["processed_count"] == 0
 
 
 class TestCompetition:

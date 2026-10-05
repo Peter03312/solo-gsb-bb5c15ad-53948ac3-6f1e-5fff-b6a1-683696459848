@@ -481,7 +481,7 @@ B4_ID=$(post "/api/applications/$S4_ID/scheduled-approvals" "{\"scheduled_at\":\
 REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
 post "/api/applications/$S4_ID/approve" "{\"expected_revision\":$REV}" >/dev/null
 curl -s "$BASE/api/scheduled-approvals/$B4_ID" \
-  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("after manual approval ->", d["status"], ";", d["outcome_reason"])'
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("after manual approval ->", d["status"], ";", d["outcome_reason"], "; processed_at:", d.get("processed_at"), "; approval_revision:", d.get("approval_revision"))'
 post "/api/applications/$S1_ID/scheduled-approvals/cancel" '{}' \
   | python3 -c 'import json,sys; print("cancel an already approved appointment ->", json.load(sys.stdin)["error"]["code"])'
 post /api/scheduled-approvals/process-due \

@@ -1311,7 +1311,12 @@ def _append_schedule_event(
 
 
 def invalidate_scheduled_approvals(
-    session, application_id: int, reason: str, revision: int
+    session,
+    application_id: int,
+    reason: str,
+    revision: int,
+    *,
+    at: datetime | None = None,
 ) -> list[ScheduledApproval]:
     """Invalidate every still-waiting appointment of a decided application.
 
@@ -1319,10 +1324,15 @@ def invalidate_scheduled_approvals(
     another path (manual single/batch approval, waitlist auto-approval during
     a suspend/revoke/emergency-release drain, handover successor approval or
     an emergency occupation).  Only ``scheduled`` rows move; already terminal
-    appointments are left untouched.  Each invalidated row appends an
-    immutable event pinned at ``revision`` (the deciding approval's
-    revision), so historical snapshots before that revision still show the
-    appointment waiting to fire.  Returns the rows invalidated.
+    appointments are left untouched.  Each invalidated row records the
+    decision instant in ``processed_at`` (``at``, defaulting to now) and
+    appends an immutable event carrying the same instant, pinned at
+    ``revision`` (the deciding approval's revision), so live queries and
+    historical snapshots from that revision onwards agree on when the
+    appointment was disposed, while snapshots before that revision still
+    show the appointment waiting to fire.  An invalidation is not a
+    scheduled auto-approval: ``approval_revision`` and
+    ``processed_guard_band`` stay NULL.  Returns the rows invalidated.
     """
     rows = (
         session.query(ScheduledApproval)
@@ -1332,10 +1342,14 @@ def invalidate_scheduled_approvals(
         )
         .all()
     )
-    now = datetime.now(timezone.utc)
+    now = at if at is not None else datetime.now(timezone.utc)
     for row in rows:
         row.status = SCHEDULED_INVALIDATED
         row.outcome_reason = reason
+        # The decision instant: recorded on the live row and on the
+        # immutable lifecycle event inside this same transaction, so both
+        # views report the identical ``processed_at``.
+        row.processed_at = now
         row.updated_at = now
         _append_schedule_event(
             session,
@@ -1344,6 +1358,7 @@ def invalidate_scheduled_approvals(
             revision,
             at=now,
             outcome_reason=reason,
+            processed_at=now,
         )
     return rows
 
@@ -1443,16 +1458,24 @@ def process_due_scheduled_approvals(
         if booking.status != SCHEDULED_STATUS:
             continue
         row = session.get(Application, booking.application_id)
-        booking.processed_at = current
-        booking.processed_guard_band = meta.guard_band
 
         if row is None or row.status != "pending":
             # Decided by another path first; that path invalidated the row.
+            # The invalidation records the sweep's decision instant, but an
+            # invalidation is not a scheduled auto-approval: no guard-band
+            # snapshot or approval revision is attached to the row.
             if row is not None:
                 invalidate_scheduled_approvals(
-                    session, row.id, f"application_{row.status}", meta.revision
+                    session,
+                    row.id,
+                    f"application_{row.status}",
+                    meta.revision,
+                    at=current,
                 )
             continue
+
+        booking.processed_at = current
+        booking.processed_guard_band = meta.guard_band
 
         candidate = to_license(row)
         effective = load_candidate_effective_licenses(
@@ -1817,6 +1840,9 @@ def replay_scheduled_approvals(
     earlier revisions); terminal outcomes only show from the revision their
     deciding event is pinned to, so older revisions still present the
     appointment as waiting to fire and never leak its approval revision.
+    The decision instant (``processed_at``) follows the same rule: it is
+    reported from the deciding revision onwards and only when the deciding
+    event recorded one (legacy rows without a reliable instant keep NULL).
     The record shape matches the live audit rows exactly.
     """
     by_booking: dict[int, list[ScheduledApprovalEvent]] = {}
@@ -1880,6 +1906,14 @@ def replay_scheduled_approvals(
             elif ev.event_type == "invalidated":
                 record["status"] = SCHEDULED_INVALIDATED
                 record["outcome_reason"] = ev.outcome_reason
+                # The decision instant is visible from the deciding
+                # revision onwards; legacy rows without a reliable one
+                # keep NULL (it is never fabricated).
+                record["processed_at"] = (
+                    iso(ev.processed_at)
+                    if ev.processed_at is not None
+                    else None
+                )
                 record["updated_at"] = iso(ev.created_at)
         if record is not None:
             records.append(record)

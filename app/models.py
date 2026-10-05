@@ -647,13 +647,20 @@ class ScheduledApproval(Base):
 
     # Processing outcome fields (NULL while the appointment is still
     # scheduled/cancelled-before-processing).
-    # The UTC instant the sweeper actually re-adjudicated the appointment.
+    # The UTC instant the appointment was disposed: the sweeper's
+    # re-adjudication instant for approved/blocked rows, or the deciding
+    # transaction's instant for invalidated rows (recorded in the same
+    # transaction that decided the application through another path).
+    # Legacy rows whose decision instant is not reliably known keep NULL;
+    # it is never fabricated.
     processed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    # Revision consumed by the scheduled approval (NULL when blocked).
+    # Revision consumed by the scheduled approval (NULL when blocked,
+    # cancelled or invalidated: an invalidation is not an approval).
     approval_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Guard band snapshot used by the processing-time re-adjudication.
+    # Guard band snapshot used by the processing-time re-adjudication
+    # (NULL for invalidated rows: no re-adjudication happened for them).
     processed_guard_band: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Blocking detail captured when processing found interference/window hits:
     # {"conflicts": [...], "restriction_window_conflicts": [...]} in the same
@@ -706,7 +713,9 @@ class ScheduledApprovalEvent(Base):
     * ``invalidated`` pins at the revision of the approval that decided the
       application through another path (manual single/batch approval,
       waitlist auto-approval, handover successor approval or emergency
-      occupation approval).
+      occupation approval) and carries that transaction's decision instant
+      in ``processed_at`` (legacy rows backfilled without a reliable
+      instant keep it NULL).
 
     Historical revision snapshots replay these rows in primary-key order and
     never read the mutable ``scheduled_approvals`` row: an appointment booked
@@ -736,7 +745,10 @@ class ScheduledApprovalEvent(Base):
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # cancelled / invalidated: why the appointment ended without firing.
     outcome_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # approved / blocked: the processing instant and the band it used.
+    # approved / blocked: the processing instant and the band it used;
+    # invalidated: the decision instant recorded in the deciding
+    # transaction (NULL for legacy rows whose decision instant is not
+    # reliably known -- it is never fabricated).
     processed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

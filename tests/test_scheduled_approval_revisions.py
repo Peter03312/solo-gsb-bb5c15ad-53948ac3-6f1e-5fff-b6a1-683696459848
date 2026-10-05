@@ -143,19 +143,29 @@ class TestOutcomeVisibilityFromDecisionRevision:
         # approved at revision 1 -> revision 0 must still show the
         # appointment waiting to fire, not "invalidated".
         b = submit(client, 100, 110, "B")
-        book(client, b, NOW + timedelta(days=1))
+        booking_id = book(client, b, NOW + timedelta(days=1))[
+            "scheduled_approval_id"
+        ]
         approve(client, b, 0)  # revision 1
 
         row0 = only_appointment_at(client, 0)
         assert row0["status"] == "scheduled"
         assert row0["outcome_reason"] is None
         assert row0["approval_revision"] is None
+        # The decision instant must not leak into the earlier revision.
+        assert row0["processed_at"] is None
 
         row1 = only_appointment_at(client, 1)
         assert row1["status"] == "invalidated"
         assert row1["outcome_reason"] == "manual_approval"
         # An invalidation is not an approval: no approval revision appears.
         assert row1["approval_revision"] is None
+        assert row1["processed_guard_band"] is None
+        # From the deciding revision onwards the snapshot reports the same
+        # decision instant as the live appointment row.
+        live = client.get(f"/api/scheduled-approvals/{booking_id}").json()
+        assert row1["processed_at"] is not None
+        assert row1["processed_at"] == live["processed_at"]
 
     def test_due_approval_visible_from_the_consumed_revision_only(self, client):
         a = submit(client, 100, 110, "A")
@@ -205,6 +215,9 @@ class TestOutcomeVisibilityFromDecisionRevision:
         assert rows2[id_a]["status"] == "invalidated"
         assert rows2[id_b]["status"] == "invalidated"
         assert rows2[id_b]["outcome_reason"] == "batch_approval"
+        # Each member's decision instant is visible from its own revision.
+        assert rows2[id_a]["processed_at"] is not None
+        assert rows2[id_b]["processed_at"] is not None
 
     def test_waitlist_auto_approval_invalidation_pins_at_auto_revision(
         self, client
@@ -228,6 +241,9 @@ class TestOutcomeVisibilityFromDecisionRevision:
         row3 = only_appointment_at(client, 3)
         assert row3["status"] == "invalidated"
         assert row3["outcome_reason"] == "waitlist_auto_approval"
+        assert row3["processed_at"] is not None
+        assert row3["approval_revision"] is None
+        assert row3["processed_guard_band"] is None
 
     def test_license_transfer_invalidation_pins_at_successor_revision(
         self, client
@@ -253,6 +269,8 @@ class TestOutcomeVisibilityFromDecisionRevision:
         row3 = only_appointment_at(client, 3)
         assert row3["status"] == "invalidated"
         assert row3["outcome_reason"] == "license_transfer"
+        assert row3["processed_at"] is not None
+        assert row3["approval_revision"] is None
 
     def test_emergency_occupation_invalidation_pins_at_approval_revision(
         self, client
@@ -270,6 +288,8 @@ class TestOutcomeVisibilityFromDecisionRevision:
         row1 = only_appointment_at(client, 1)
         assert row1["status"] == "invalidated"
         assert row1["outcome_reason"] == "emergency_occupation"
+        assert row1["processed_at"] is not None
+        assert row1["approval_revision"] is None
 
     def test_blocked_visible_from_decision_revision_without_consuming_one(
         self, client
@@ -453,3 +473,48 @@ class TestLegacyRowBackfill:
         # Idempotent: a second run changes nothing.
         _ensure_scheduled_approval_events()
         assert only_appointment_at(client, 1)["status"] == "approved"
+
+    def test_legacy_invalidated_row_keeps_null_processed_at(self, client):
+        # A database written before the invalidation chain recorded decision
+        # instants: an invalidated appointment row with no lifecycle events
+        # and no processed_at.  The backfill must not fabricate an instant:
+        # both the live row and the replayed snapshot keep NULL.
+        from app.db import SessionLocal, _ensure_scheduled_approval_events
+        from app.models import (
+            Application,
+            ApprovalEvent,
+            RevisionMeta,
+            ScheduledApproval,
+        )
+
+        a = submit(client, 100, 110, "A")
+        with SessionLocal() as s, s.begin():
+            meta = s.get(RevisionMeta, 1)
+            meta.revision = 1
+            s.add(ApprovalEvent(revision=1, application_id=a, guard_band=2.0))
+            s.get(Application, a).status = "approved"
+            legacy = ScheduledApproval(
+                application_id=a,
+                scheduled_at=NOW + timedelta(hours=1),
+                status="invalidated",
+                outcome_reason="manual_approval",
+            )
+            s.add(legacy)
+            s.flush()
+            booking_id = legacy.id
+
+        _ensure_scheduled_approval_events()
+        # The live row keeps its (empty) processed_at.
+        live = client.get(f"/api/scheduled-approvals/{booking_id}").json()
+        assert live["status"] == "invalidated"
+        assert "processed_at" not in live
+        # Revision 0 still shows the appointment waiting; revision 1 shows
+        # the invalidation with outcome_reason but a NULL processed_at.
+        row0 = only_appointment_at(client, 0)
+        assert row0["status"] == "scheduled"
+        assert row0["processed_at"] is None
+        row1 = only_appointment_at(client, 1)
+        assert row1["status"] == "invalidated"
+        assert row1["outcome_reason"] == "manual_approval"
+        assert row1["processed_at"] is None
+        assert row1["approval_revision"] is None

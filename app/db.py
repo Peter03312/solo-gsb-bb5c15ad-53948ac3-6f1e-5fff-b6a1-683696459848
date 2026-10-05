@@ -240,8 +240,11 @@ def _ensure_scheduled_approval_events() -> None:
     how those rows were presented before the event stream existed).  A due
     approval pins at its recorded ``approval_revision`` and an invalidation
     at the revision of the application's approval event (the decision that
-    superseded the appointment).  Rows that already have events are skipped,
-    so the backfill runs once and never touches post-upgrade history.
+    superseded the appointment).  A legacy invalidation has no reliably
+    recorded decision instant, so its event keeps ``processed_at`` NULL --
+    the time is never fabricated.  Rows that already have events are
+    skipped, so the backfill runs once and never touches post-upgrade
+    history.
     """
     from .models import (
         ApprovalEvent,
